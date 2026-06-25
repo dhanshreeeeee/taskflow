@@ -1,0 +1,274 @@
+// TaskFlow - Employee Task & Leave Management
+// Prisma schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STAFF
+  LEAD
+  ADMIN
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  CHANGES_REQUESTED
+  DONE
+  BLOCKED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum TransferStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum RecurrenceType {
+  ONE_TIME
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(STAFF)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  // A Staff belongs to one team (led by a Lead). Leads/Admins have teamId = null.
+  teamId String?
+  team   Team?   @relation("TeamMembers", fields: [teamId], references: [id])
+
+  // If this user IS a Lead, this is the team they lead (1:1)
+  leadOfTeam Team? @relation("TeamLead")
+
+  // Task relations
+  tasksCreated     Task[]           @relation("CreatedBy")
+  assignedTasks    TaskAssignee[]
+  comments         TaskComment[]
+  statusChanges    TaskActivity[]   @relation("ActivityActor")
+  templatesCreated RecurringTaskTemplate[] @relation("TemplateCreatedBy")
+
+  // Transfer requests
+  transfersRequested TaskTransferRequest[] @relation("TransferRequestedBy")
+  transfersFrom       TaskTransferRequest[] @relation("TransferFromUser")
+  transfersTo         TaskTransferRequest[] @relation("TransferToUser")
+  transfersReviewed   TaskTransferRequest[] @relation("TransferReviewedBy")
+
+  // Leave relations
+  leaveRequests   LeaveRequest[] @relation("LeaveOwner")
+  leaveReviewed   LeaveRequest[] @relation("LeaveReviewedBy")
+
+  // Approvals on tasks
+  reviewsGiven Task[] @relation("ReviewedBy")
+
+  @@index([teamId])
+}
+
+model Team {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  leadId String? @unique
+  lead   User?   @relation("TeamLead", fields: [leadId], references: [id])
+
+  members User[] @relation("TeamMembers")
+  tasks   Task[]
+  recurringTemplates RecurringTaskTemplate[]
+
+  @@index([leadId])
+}
+
+model Task {
+  id          String       @id @default(uuid())
+  title       String
+  description String?
+  priority    TaskPriority @default(MEDIUM)
+  status      TaskStatus   @default(TODO)
+  dueDate     DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  recurrenceType RecurrenceType @default(ONE_TIME)
+
+  // If this task was auto-generated from a recurring template, link back to it.
+  templateId String?
+  template   RecurringTaskTemplate? @relation(fields: [templateId], references: [id])
+
+  createdById String
+  createdBy   User   @relation("CreatedBy", fields: [createdById], references: [id])
+
+  teamId String?
+  team   Team?   @relation(fields: [teamId], references: [id])
+
+  // Review / approval
+  reviewedById String?
+  reviewedBy   User?   @relation("ReviewedBy", fields: [reviewedById], references: [id])
+  reviewNote   String?
+  reviewedAt   DateTime?
+
+  assignees         TaskAssignee[]
+  comments          TaskComment[]
+  activity          TaskActivity[]
+  transferRequests  TaskTransferRequest[]
+
+  @@index([teamId])
+  @@index([status])
+  @@index([recurrenceType])
+}
+
+// The "master" definition for a recurring task. Each cycle, the generator
+// creates a real Task instance linked back to this template via templateId.
+model RecurringTaskTemplate {
+  id             String         @id @default(uuid())
+  title          String
+  description    String?
+  priority       TaskPriority   @default(MEDIUM)
+  recurrenceType RecurrenceType // DAILY | WEEKLY | MONTHLY | QUARTERLY (not ONE_TIME)
+  isActive       Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+
+  createdById String
+  createdBy   User   @relation("TemplateCreatedBy", fields: [createdById], references: [id])
+
+  teamId String?
+  team   Team?   @relation(fields: [teamId], references: [id])
+
+  // Default assignees applied to every generated instance
+  assigneeIds String[] // stored as array of user ids; validated in app layer
+
+  // Scheduling anchors
+  weekday      Int?      // 0=Sunday..6=Saturday, used for WEEKLY
+  dayOfMonth   Int?      // 1-28, used for MONTHLY and QUARTERLY (quarter-start month)
+  lastRunAt    DateTime?
+  nextRunAt    DateTime  // when the next instance should be generated
+
+  generatedTasks Task[]
+
+  @@index([nextRunAt])
+  @@index([isActive])
+}
+
+// Join table: many-to-many Task <-> User (assignees)
+model TaskAssignee {
+  id     String @id @default(uuid())
+  taskId String
+  userId String
+
+  assignee User @relation(fields: [userId], references: [id])
+  task     Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  assignedAt DateTime @default(now())
+
+  @@unique([taskId, userId])
+  @@index([userId])
+}
+
+model TaskComment {
+  id        String   @id @default(uuid())
+  taskId    String
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id])
+
+  @@index([taskId])
+}
+
+// Full audit trail: status changes, reassignments, etc.
+model TaskActivity {
+  id        String   @id @default(uuid())
+  taskId    String
+  actorId   String
+  action    String   // e.g. "STATUS_CHANGE", "ASSIGNED", "UNASSIGNED", "CREATED", "TRANSFERRED", "REVIEWED"
+  fromValue String?
+  toValue   String?
+  createdAt DateTime @default(now())
+
+  task  Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actor User @relation("ActivityActor", fields: [actorId], references: [id])
+
+  @@index([taskId])
+}
+
+model TaskTransferRequest {
+  id        String         @id @default(uuid())
+  taskId    String
+  status    TransferStatus @default(PENDING)
+  reason    String?
+  createdAt DateTime       @default(now())
+  reviewedAt DateTime?
+  reviewNote String?
+
+  requestedById String
+  requestedBy   User   @relation("TransferRequestedBy", fields: [requestedById], references: [id])
+
+  fromUserId String
+  fromUser   User   @relation("TransferFromUser", fields: [fromUserId], references: [id])
+
+  toUserId String
+  toUser   User   @relation("TransferToUser", fields: [toUserId], references: [id])
+
+  reviewedById String?
+  reviewedBy   User?   @relation("TransferReviewedBy", fields: [reviewedById], references: [id])
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model LeaveRequest {
+  id        String      @id @default(uuid())
+  userId    String
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  status    LeaveStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+  reviewedAt DateTime?
+  reviewNote String?
+
+  // tasks reassigned as a result of this leave get logged here (informational)
+  user       User  @relation("LeaveOwner", fields: [userId], references: [id])
+  reviewedById String?
+  reviewedBy   User?   @relation("LeaveReviewedBy", fields: [reviewedById], references: [id])
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Holiday {
+  id   String   @id @default(uuid())
+  date DateTime @unique @db.Date
+  name String
+}
